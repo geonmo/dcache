@@ -1,0 +1,168 @@
+#
+# Builds dCache with the GSDC site patches whenever a new official release of
+# the tracked series is published on Docker Hub:
+#
+#  - RPM, attached to a GitHub release named <version>-2_GSDC
+#  - container image ghcr.io/<owner>/dcache:<version>-2_GSDC, which is the
+#    official dcache/dcache:<version> image with the patched files on top
+#
+# The GitHub release doubles as the "already built" marker.
+#
+name: GSDC site build
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'dCache version to build (e.g. 11.2.10). Empty: newest release of the series.'
+        required: false
+        default: ''
+      force:
+        description: 'Rebuild even if the release already exists'
+        type: boolean
+        default: false
+
+env:
+  SERIES: '11.2'
+  BUILD_ID: '2'
+  LOCAL_VERSION: '_GSDC'
+  UPSTREAM: 'https://github.com/dCache/dcache.git'
+  IMAGE: ghcr.io/${{ github.repository_owner }}/dcache
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.detect.outputs.version }}
+      latest: ${{ steps.detect.outputs.latest }}
+    steps:
+      - id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          newest=$(curl -sf "https://hub.docker.com/v2/repositories/dcache/dcache/tags?page_size=100&name=${SERIES}." \
+                     | jq -r '.results[].name' \
+                     | grep -E "^${SERIES//./\\.}\.[0-9]+$" \
+                     | sort -V | tail -n 1)
+          if [[ -z "$newest" ]]; then
+            echo "::error::No dcache/dcache:${SERIES}.x image found on Docker Hub"
+            exit 1
+          fi
+
+          version=${INPUT_VERSION:-$newest}
+          if ! curl -sf -o /dev/null "https://hub.docker.com/v2/repositories/dcache/dcache/tags/${version}"; then
+            echo "::error::dcache/dcache:${version} does not exist on Docker Hub"
+            exit 1
+          fi
+
+          release="${version}-${BUILD_ID}${LOCAL_VERSION}"
+          if gh release view "$release" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1 && [[ "$FORCE" != true ]]; then
+            echo "Release $release already exists; nothing to do."
+            version=
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "latest=$([[ "$version" == "$newest" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: detect
+    if: needs.detect.outputs.version != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      issues: write
+    env:
+      VERSION: ${{ needs.detect.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out site files
+        uses: actions/checkout@v4
+        with:
+          path: site
+
+      - name: Check out dCache ${{ env.VERSION }}
+        run: git clone --quiet --depth 1 --branch "$VERSION" "$UPSTREAM" dcache
+
+      - name: Apply site patches
+        id: patch
+        working-directory: dcache
+        run: |
+          git config user.name "GSDC site build"
+          git config user.email "gsdc-build@users.noreply.github.com"
+          git am "$GITHUB_WORKSPACE"/site/patches/*.patch
+
+      - name: Report patch failure
+        if: failure() && steps.patch.outcome == 'failure'
+        run: |
+          gh issue create -R "$GITHUB_REPOSITORY" \
+            --title "Site patches do not apply to dCache $VERSION" \
+            --body "The patches in \`patches/\` failed to apply to dCache $VERSION. Rebase them onto the $VERSION tag and update the \`gsdc\` branch, then re-run the workflow. See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+          cache-dependency-path: dcache/pom.xml
+
+      - name: Install rpmbuild
+        run: sudo apt-get update -q && sudo apt-get install -y -q rpm
+
+      - name: Run tests of patched code
+        working-directory: dcache
+        run: >
+          mvn -B -q -am -pl modules/dcache-chimera,modules/dcache-xrootd install
+          -Dtest='DCacheAwareJdbcFsTest,XrootdDoor*Test'
+          -Dsurefire.failIfNoSpecifiedTests=false
+          -Dmaven.javadoc.skip=true
+
+      - name: Build RPM and tarball
+        working-directory: dcache
+        run: >
+          mvn -B -q -am -pl packages/fhs,packages/tar -P rpm package
+          -DskipTests -Dmaven.javadoc.skip=true
+          -Dbuild.id="$BUILD_ID" -Dlocal.version="$LOCAL_VERSION"
+
+      - name: Prepare container overlay
+        run: >
+          bash site/container/prepare-overlay.sh "$VERSION"
+          dcache/packages/tar/target/dcache-"$VERSION".tar.gz context
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: context
+          push: true
+          build-args: DCACHE_VERSION=${{ env.VERSION }}
+          tags: |
+            ${{ env.IMAGE }}:${{ env.VERSION }}-${{ env.BUILD_ID }}${{ env.LOCAL_VERSION }}
+            ${{ needs.detect.outputs.latest == 'true' && format('{0}:{1}-gsdc', env.IMAGE, env.SERIES) || '' }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ env.VERSION }}-${{ env.BUILD_ID }}${{ env.LOCAL_VERSION }}
+            org.opencontainers.image.base.name=docker.io/dcache/dcache:${{ env.VERSION }}
+
+      - name: Create release
+        run: |
+          release="${VERSION}-${BUILD_ID}${LOCAL_VERSION}"
+          {
+            echo "dCache $VERSION with the GSDC site patches:"
+            echo
+            git -C dcache log --reverse --format='- %s' -n "$(ls site/patches/*.patch | wc -l)"
+            echo
+            echo "Container image: \`$IMAGE:$release\`"
+          } > notes.md
+          gh release delete "$release" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag 2> /dev/null || true
+          gh release create "$release" -R "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --title "dCache $release" --notes-file notes.md \
+            dcache/packages/fhs/target/rpmbuild/RPMS/noarch/dcache-*.rpm

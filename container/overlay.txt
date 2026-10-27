@@ -1,0 +1,13 @@
+# Files taken from the patched dCache tarball and copied over the official
+# dcache/dcache image, relative to /opt/dcache. ${VERSION} is replaced by the
+# dCache version being built (e.g., 11.2.10).
+#
+# Every file must already exist in the official image: the build fails
+# otherwise, so that a renamed or missing file is noticed.
+#
+# Keep this list in sync with the modules touched by patches/*.patch.
+share/classes/dcache-chimera-${VERSION}.jar
+share/classes/dcache-nfs-${VERSION}.jar
+share/classes/dcache-xrootd-${VERSION}.jar
+share/defaults/nfs.properties
+share/defaults/xrootd.properties

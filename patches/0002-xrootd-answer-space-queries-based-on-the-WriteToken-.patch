@@ -1,0 +1,434 @@
+From bfbacb2eccd62ec0367be0ca2241ad6ddc6e506d Mon Sep 17 00:00:00 2001
+From: Geonmo Ryu <geonmo@kisti.re.kr>
+Date: Tue, 27 Oct 2026 17:56:08 +0900
+Subject: [PATCH 2/2] xrootd: answer space queries based on the WriteToken tag
+
+Motivation:
+The xrootd door doesn't support kXR_Qspace queries. As a result,
+`xrdfs spaceinfo` fails and `df` on a directory mounted with xrootdfs
+shows a size of zero (and plain `df` hides the mount).
+
+Modification:
+Handle kXR_Qspace in XrootdRedirectHandler if space reservation is
+enabled. The door looks up the space reservation of the queried path
+through its WriteToken directory tag, as the FTP door does for SITE
+USAGE, and replies with the reservation size and the space still
+available in it, using the format of xrootd's oss plugin
+(oss.space, oss.free, oss.used, oss.maxf, ...).
+
+The space reservation is looked up through the existing
+ReservationCaches space lookup cache, for which a space manager cell
+stub is added to the door.
+
+Result:
+Clients can query the capacity of a space reservation through the
+xrootd door, e.g., with `xrdfs spaceinfo` or `df` on an xrootdfs mount.
+
+Target: master
+Require-book: yes
+Require-notes: yes
+Signed-off-by: Geonmo Ryu <geonmo@kisti.re.kr>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X3vgU3NxbVFvgV6UtwTwvP
+---
+ .../src/main/markdown/config-xrootd.md        |  21 +++
+ .../org/dcache/xrootd/door/XrootdDoor.java    |  45 ++++++
+ .../xrootd/door/XrootdRedirectHandler.java    |  45 ++++++
+ .../org/dcache/xrootd/door/xrootd.xml         |  14 ++
+ .../xrootd/door/XrootdDoorSpaceQueryTest.java | 138 ++++++++++++++++++
+ skel/share/defaults/xrootd.properties         |   9 ++
+ 6 files changed, 272 insertions(+)
+ create mode 100644 modules/dcache-xrootd/src/test/java/org/dcache/xrootd/door/XrootdDoorSpaceQueryTest.java
+
+diff --git a/docs/TheBook/src/main/markdown/config-xrootd.md b/docs/TheBook/src/main/markdown/config-xrootd.md
+index 6b3c652590..f0e6d008d2 100644
+--- a/docs/TheBook/src/main/markdown/config-xrootd.md
++++ b/docs/TheBook/src/main/markdown/config-xrootd.md
+@@ -685,6 +685,27 @@ xrootd.net.proxy.response-timeout-in-secs=30
+ dcache.java.memory.direct=16384m
+ ```
+ 
++### Space usage queries
++
++If space reservation is enabled (`xrootd.enable.space-reservation`), the
++door answers space queries (`kXR_Qspace`) for paths that are associated
++with a space reservation through the `WriteToken` directory tag. The
++reply reports the size of the reservation and the space still available
++in it, using the same format as xrootd's oss plugin. This allows
++clients to see the capacity of a space reservation, e.g.:
++
++```console-user
++xrdfs door.example.org spaceinfo /data/cms
++|Path:               /data/cms
++|Total:              1099511627776
++|Free:               274877906944
++|Used:               824633720832
++|Largest free chunk: 274877906944
++```
++
++and makes `df` show the same values on a directory mounted with
++`xrootdfs`. For paths without a `WriteToken` tag the query fails.
++
+ ### Other configuration options
+ 
+ The `xrootd-door` has several other configuration properties. You can
+diff --git a/modules/dcache-xrootd/src/main/java/org/dcache/xrootd/door/XrootdDoor.java b/modules/dcache-xrootd/src/main/java/org/dcache/xrootd/door/XrootdDoor.java
+index 00e3890005..6960ff8c9c 100644
+--- a/modules/dcache-xrootd/src/main/java/org/dcache/xrootd/door/XrootdDoor.java
++++ b/modules/dcache-xrootd/src/main/java/org/dcache/xrootd/door/XrootdDoor.java
+@@ -39,8 +39,10 @@ import static org.dcache.xrootd.protocol.XrootdProtocol.kXR_xset;
+ 
+ import com.google.common.base.Splitter;
+ import com.google.common.base.Throwables;
++import com.google.common.cache.LoadingCache;
+ import com.google.common.collect.Range;
+ import diskCacheV111.poolManager.PoolMonitorV5;
++import diskCacheV111.services.space.Space;
+ import diskCacheV111.util.CacheException;
+ import diskCacheV111.util.FileExistsCacheException;
+ import diskCacheV111.util.FileLocality;
+@@ -88,6 +90,7 @@ import java.util.Set;
+ import java.util.UUID;
+ import java.util.concurrent.Callable;
+ import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.RejectedExecutionException;
+ import java.util.concurrent.ScheduledExecutorService;
+ import java.util.concurrent.ScheduledFuture;
+@@ -190,6 +193,9 @@ public class XrootdDoor
+     private CellStub pinManagerStub;
+     private CellStub _billingStub;
+ 
++    private boolean _spaceReservationEnabled;
++    private LoadingCache<String, Optional<Space>> _spaceLookupCache;
++
+     private PoolMonitor _poolMonitor;
+ 
+     private final PermissionHandler _pdp = new ChainedPermissionHandler(
+@@ -282,6 +288,18 @@ public class XrootdDoor
+         this.pinManagerStub = pinManagerStub;
+     }
+ 
++    public void setSpaceReservationEnabled(boolean enabled) {
++        _spaceReservationEnabled = enabled;
++    }
++
++    public boolean isSpaceReservationEnabled() {
++        return _spaceReservationEnabled;
++    }
++
++    public void setSpaceLookupCache(LoadingCache<String, Optional<Space>> cache) {
++        _spaceLookupCache = cache;
++    }
++
+     @Required
+     public void setPnfsStub(CellStub pnfsStub) {
+         _pnfsStub = pnfsStub;
+@@ -1167,6 +1185,33 @@ public class XrootdDoor
+         return attributes.getChecksums();
+     }
+ 
++    /**
++     * Returns the space reservation that the given path is associated with through the
++     * WriteToken directory tag.
++     */
++    public Space getWriteTokenSpace(FsPath fullPath, Subject subject, Restriction restriction)
++          throws CacheException {
++        PnfsHandler pnfsHandler = new PnfsHandler(_pnfs, subject, restriction);
++        FileAttributes attributes = pnfsHandler.getFileAttributes(fullPath.toString(),
++              EnumSet.of(STORAGEINFO));
++        String token = attributes.getStorageInfo().getMap().get("writeToken");
++        if (token == null) {
++            throw new CacheException(CacheException.INVALID_ARGS,
++                  fullPath + " is not under space management");
++        }
++
++        try {
++            return _spaceLookupCache.get(token).orElseThrow(
++                  () -> new CacheException("Space reservation " + token + " not found"));
++        } catch (ExecutionException e) {
++            Throwable cause = e.getCause();
++            Throwables.throwIfInstanceOf(cause, CacheException.class);
++            Throwables.throwIfUnchecked(cause);
++            throw new CacheException("Failed to look up space reservation " + token + ": "
++                  + cause.getMessage(), cause);
++        }
++    }
++
+     public FileStatus getFileStatus(FsPath fullPath, Subject subject,
+           Restriction restriction, String clientHost) throws CacheException {
+         /* Fetch file attributes.
+diff --git a/modules/dcache-xrootd/src/main/java/org/dcache/xrootd/door/XrootdRedirectHandler.java b/modules/dcache-xrootd/src/main/java/org/dcache/xrootd/door/XrootdRedirectHandler.java
+index 93aa40153d..fc04c27897 100644
+--- a/modules/dcache-xrootd/src/main/java/org/dcache/xrootd/door/XrootdRedirectHandler.java
++++ b/modules/dcache-xrootd/src/main/java/org/dcache/xrootd/door/XrootdRedirectHandler.java
+@@ -29,6 +29,7 @@ import static org.dcache.xrootd.protocol.XrootdProtocol.kXR_InvalidRequest;
+ import static org.dcache.xrootd.protocol.XrootdProtocol.kXR_ItExists;
+ import static org.dcache.xrootd.protocol.XrootdProtocol.kXR_Qcksum;
+ import static org.dcache.xrootd.protocol.XrootdProtocol.kXR_Qconfig;
++import static org.dcache.xrootd.protocol.XrootdProtocol.kXR_Qspace;
+ import static org.dcache.xrootd.protocol.XrootdProtocol.kXR_ServerError;
+ import static org.dcache.xrootd.protocol.XrootdProtocol.kXR_async;
+ import static org.dcache.xrootd.protocol.XrootdProtocol.kXR_compress;
+@@ -61,6 +62,7 @@ import static org.dcache.xrootd.util.TriedRc.IOERR;
+ import com.google.common.base.Strings;
+ import com.google.common.base.Throwables;
+ import com.google.common.net.InetAddresses;
++import diskCacheV111.services.space.Space;
+ import diskCacheV111.util.CacheException;
+ import diskCacheV111.util.FileExistsCacheException;
+ import diskCacheV111.util.FileIsNewCacheException;
+@@ -1096,11 +1098,54 @@ public class XrootdRedirectHandler extends ConcurrentXrootdRequestHandler {
+                 } catch (CacheException e) {
+                     throw xrootdException(e);
+                 }
++
++            case kXR_Qspace:
++                if (!_door.isSpaceReservationEnabled()) {
++                    return unsupported(ctx, msg);
++                }
++                return querySpace(msg);
++
+             default:
+                 return unsupported(ctx, msg);
+         }
+     }
+ 
++    /**
++     * Reports the space reservation of the queried path, as given by its WriteToken directory
++     * tag, in the format used by xrootd's oss plugin.
++     */
++    private QueryResponse querySpace(QueryRequest msg) throws XrootdException {
++        String args = msg.getArgs();
++        int pos = args.indexOf(XrootdProtocol.OPAQUE_DELIMITER);
++        String path = pos > -1 ? args.substring(0, pos) : args;
++        String opaque = pos > -1 ? args.substring(pos + 1) : "";
++        if (path.isEmpty()) {
++            throw new XrootdException(kXR_ArgMissing, "no path specified");
++        }
++
++        try {
++            LoginSessionInfo loginSessionInfo = sessionInfo();
++            Space space = _door.getWriteTokenSpace(
++                  createFullPath(path, safelyExtractOpaque(opaque)),
++                  loginSessionInfo.getSubject(),
++                  loginSessionInfo.getRestriction());
++            return new QueryResponse(msg, toSpaceInfo(space));
++        } catch (CacheException e) {
++            throw xrootdException(e);
++        }
++    }
++
++    static String toSpaceInfo(Space space) {
++        long size = space.getSizeInBytes();
++        long free = Math.max(0L, space.getAvailableSpaceInBytes());
++        return "oss.cgroup=" + space.getId()
++              + "&oss.space=" + size
++              + "&oss.free=" + free
++              + "&oss.maxf=" + free
++              + "&oss.used=" + (size - free)
++              + "&oss.quota=" + size;
++    }
++
+     @Override
+     protected XrootdResponse<DirListRequest> doOnDirList(ChannelHandlerContext ctx,
+           DirListRequest request)
+diff --git a/modules/dcache-xrootd/src/main/resources/org/dcache/xrootd/door/xrootd.xml b/modules/dcache-xrootd/src/main/resources/org/dcache/xrootd/door/xrootd.xml
+index a91b1da235..adb447fe66 100644
+--- a/modules/dcache-xrootd/src/main/resources/org/dcache/xrootd/door/xrootd.xml
++++ b/modules/dcache-xrootd/src/main/resources/org/dcache/xrootd/door/xrootd.xml
+@@ -61,6 +61,13 @@
+     <property name="destination" value="${xrootd.service.billing}"/>
+   </bean>
+ 
++  <bean id="space-manager-stub" class="org.dcache.cells.CellStub">
++    <description>Space manager cell stub</description>
++    <property name="destination" value="${xrootd.service.spacemanager}"/>
++    <property name="timeout" value="${xrootd.service.spacemanager.timeout}"/>
++    <property name="timeoutUnit" value="${xrootd.service.spacemanager.timeout.unit}"/>
++  </bean>
++
+   <bean id="gPlazma-stub" class="org.dcache.cells.CellStub">
+     <description>gPlazma communication stub</description>
+     <property name="destination" value="${xrootd.service.gplazma}"/>
+@@ -193,6 +200,13 @@
+       </bean>
+     </property>
+     <property name="billingStub" ref="billing-stub"/>
++    <property name="spaceReservationEnabled" value="${xrootd.enable.space-reservation}"/>
++    <property name="spaceLookupCache">
++      <bean class="org.dcache.space.ReservationCaches" factory-method="buildSpaceLookupCache">
++        <constructor-arg ref="space-manager-stub"/>
++        <constructor-arg ref="scheduled-thread-pool"/>
++      </bean>
++    </property>
+     <property name="writePaths" value="${xrootd.authz.write-paths}"/>
+     <property name="readPaths" value="${xrootd.authz.read-paths}"/>
+     <property name="pnfsHandler" ref="pnfs"/>
+diff --git a/modules/dcache-xrootd/src/test/java/org/dcache/xrootd/door/XrootdDoorSpaceQueryTest.java b/modules/dcache-xrootd/src/test/java/org/dcache/xrootd/door/XrootdDoorSpaceQueryTest.java
+new file mode 100644
+index 0000000000..a32a439f50
+--- /dev/null
++++ b/modules/dcache-xrootd/src/test/java/org/dcache/xrootd/door/XrootdDoorSpaceQueryTest.java
+@@ -0,0 +1,138 @@
++package org.dcache.xrootd.door;
++
++import static org.hamcrest.MatcherAssert.assertThat;
++import static org.hamcrest.Matchers.is;
++import static org.hamcrest.Matchers.sameInstance;
++import static org.junit.Assert.assertThrows;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
++
++import com.google.common.base.Function;
++import com.google.common.cache.CacheBuilder;
++import com.google.common.cache.CacheLoader;
++import com.google.common.util.concurrent.Futures;
++import diskCacheV111.services.space.Space;
++import diskCacheV111.services.space.SpaceState;
++import diskCacheV111.util.AccessLatency;
++import diskCacheV111.util.CacheException;
++import diskCacheV111.util.FsPath;
++import diskCacheV111.util.PnfsHandler;
++import diskCacheV111.util.RetentionPolicy;
++import diskCacheV111.util.TimeoutCacheException;
++import diskCacheV111.vehicles.GenericStorageInfo;
++import java.util.Optional;
++import javax.security.auth.Subject;
++import org.dcache.auth.Subjects;
++import org.dcache.auth.attributes.Restrictions;
++import org.dcache.cells.CellStub;
++import org.dcache.vehicles.FileAttributes;
++import org.dcache.vehicles.PnfsGetFileAttributes;
++import org.junit.Before;
++import org.junit.Test;
++
++/**
++ * Unit tests for {@link XrootdDoor#getWriteTokenSpace} and
++ * {@link XrootdRedirectHandler#toSpaceInfo}, which back kXR_Qspace queries.
++ */
++public class XrootdDoorSpaceQueryTest {
++
++    private static final FsPath PATH = FsPath.create("/data/cms");
++
++    private CellStub pnfsCellStub;
++    private XrootdDoor door;
++    private Subject subject;
++
++    @Before
++    public void setUp() {
++        pnfsCellStub = mock(CellStub.class);
++
++        door = new XrootdDoor();
++        door.setPnfsHandler(new PnfsHandler(pnfsCellStub));
++        door.setSpaceReservationEnabled(true);
++
++        subject = Subjects.of(1000, 1000, new int[]{1000});
++    }
++
++    @Test
++    public void shouldReturnSpaceOfWriteToken() throws Exception {
++        Space space = space(1000, 300, 200);
++        givenWriteToken("42");
++        givenSpaceLookup(token -> token.equals("42") ? Optional.of(space) : Optional.empty());
++
++        assertThat(door.getWriteTokenSpace(PATH, subject, Restrictions.none()),
++              is(sameInstance(space)));
++    }
++
++    @Test
++    public void shouldFailWithoutWriteToken() {
++        givenWriteToken(null);
++        givenSpaceLookup(token -> Optional.empty());
++
++        CacheException e = assertThrows(CacheException.class,
++              () -> door.getWriteTokenSpace(PATH, subject, Restrictions.none()));
++        assertThat(e.getRc(), is(CacheException.INVALID_ARGS));
++    }
++
++    @Test
++    public void shouldFailIfSpaceReservationNotFound() {
++        givenWriteToken("42");
++        givenSpaceLookup(token -> Optional.empty());
++
++        assertThrows(CacheException.class,
++              () -> door.getWriteTokenSpace(PATH, subject, Restrictions.none()));
++    }
++
++    @Test
++    public void shouldPropagateSpaceManagerFailure() {
++        givenWriteToken("42");
++        door.setSpaceLookupCache(CacheBuilder.newBuilder().build(new CacheLoader<>() {
++            @Override
++            public Optional<Space> load(String token) throws Exception {
++                throw new TimeoutCacheException("timeout");
++            }
++        }));
++
++        assertThrows(TimeoutCacheException.class,
++              () -> door.getWriteTokenSpace(PATH, subject, Restrictions.none()));
++    }
++
++    @Test
++    public void shouldFormatSpaceInfoLikeXrootdOss() {
++        assertThat(XrootdRedirectHandler.toSpaceInfo(space(1000, 300, 200)),
++              is("oss.cgroup=42&oss.space=1000&oss.free=500&oss.maxf=500"
++                    + "&oss.used=500&oss.quota=1000"));
++    }
++
++    @Test
++    public void shouldNotReportNegativeFreeSpace() {
++        assertThat(XrootdRedirectHandler.toSpaceInfo(space(100, 80, 50)),
++              is("oss.cgroup=42&oss.space=100&oss.free=0&oss.maxf=0"
++                    + "&oss.used=100&oss.quota=100"));
++    }
++
++    private void givenWriteToken(String token) {
++        when(pnfsCellStub.send(any(PnfsGetFileAttributes.class), anyLong()))
++              .thenAnswer(invocation -> {
++                  PnfsGetFileAttributes request = invocation.getArgument(0);
++                  GenericStorageInfo storageInfo = new GenericStorageInfo();
++                  if (token != null) {
++                      storageInfo.setKey("writeToken", token);
++                  }
++                  FileAttributes attributes = new FileAttributes();
++                  attributes.setStorageInfo(storageInfo);
++                  request.setFileAttributes(attributes);
++                  return Futures.immediateFuture(request);
++              });
++    }
++
++    private void givenSpaceLookup(Function<String, Optional<Space>> lookup) {
++        door.setSpaceLookupCache(CacheBuilder.newBuilder().build(CacheLoader.from(lookup)));
++    }
++
++    private static Space space(long size, long used, long allocated) {
++        return new Space(42, null, null, RetentionPolicy.REPLICA, AccessLatency.ONLINE, 1, size,
++              0, null, "test", SpaceState.RESERVED, used, allocated);
++    }
++}
+diff --git a/skel/share/defaults/xrootd.properties b/skel/share/defaults/xrootd.properties
+index 0d97a26528..4a484dd26a 100644
+--- a/skel/share/defaults/xrootd.properties
++++ b/skel/share/defaults/xrootd.properties
+@@ -77,6 +77,15 @@ xrootd.service.pinmanager=${dcache.service.pinmanager}
+ xrootd.service.pinmanager.timeout=300000
+ (one-of?MILLISECONDS|SECONDS|MINUTES|HOURS|DAYS)xrootd.service.pinmanager.timeout.unit=MILLISECONDS
+ 
++# Cell address of spacemanager service
++#
++# Used to answer kXR_Qspace queries (e.g., xrdfs spaceinfo, df on an
++# xrootdfs mount) with the space reservation given by the WriteToken
++# tag of the queried path. Only used if space reservation is enabled.
++xrootd.service.spacemanager=${dcache.service.spacemanager}
++xrootd.service.spacemanager.timeout=30000
++(one-of?MILLISECONDS|SECONDS|MINUTES|HOURS|DAYS)xrootd.service.spacemanager.timeout.unit=MILLISECONDS
++
+ # Cell address of poolmanager service
+ xrootd.service.poolmanager=${xrootd.service.poolmanager-space-${xrootd.enable.space-reservation}}
+ (immutable)xrootd.service.poolmanager-space-false=${dcache.service.poolmanager}
+-- 
+2.52.0
+
