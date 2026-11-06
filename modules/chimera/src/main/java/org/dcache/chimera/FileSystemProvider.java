@@ -436,6 +436,14 @@ public interface FileSystemProvider extends Closeable {
     FsStat getFsStat() throws ChimeraFsException;
 
     /**
+     * Returns the file system statistics for the given inode, e.g. the space available to a
+     * directory. By default, these are the statistics of the whole file system.
+     */
+    default FsStat getFsStat(FsInode inode) throws ChimeraFsException {
+        return getFsStat();
+    }
+
+    /**
      * Get list of Access Control Entries for specified inode.
      *
      * @param inode

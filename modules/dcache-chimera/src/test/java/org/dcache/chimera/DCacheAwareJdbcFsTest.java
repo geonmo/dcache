@@ -1,7 +1,10 @@
 package org.dcache.chimera;
 
 import static org.junit.Assert.assertEquals;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.google.common.io.Resources;
@@ -9,6 +12,7 @@ import com.zaxxer.hikari.HikariDataSource;
 import diskCacheV111.util.CacheException;
 import java.io.InputStream;
 import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.util.Properties;
 import liquibase.Liquibase;
@@ -92,11 +96,79 @@ public class DCacheAwareJdbcFsTest {
         assertEquals(namespaceStat.getUsedSpace(), fs.getFsStat().getUsedSpace());
     }
 
-    @Test(expected = IllegalArgumentException.class)
-    public void shouldRejectReservationOfWriteToken() {
+    @Test
+    public void shouldReportReservationOfWriteTokenOfDirectory() throws Exception {
+        Capacity.Provider provider = writeTokenProvider();
+        fs.setCapacity(provider);
+        FsInode dir = fs.mkdir("/dir");
+        setWriteToken(dir, "42\n");
+
+        FsStat stat = fs.getFsStat(dir);
+
+        verify(provider).getForWriteToken("42");
+        assertEquals(1L << 60, stat.getTotalSpace());
+        assertEquals(namespaceStat.getUsedFiles(), stat.getUsedFiles());
+    }
+
+    @Test
+    public void shouldReportReservationOfWriteTokenOfDirectoryOfFile() throws Exception {
+        Capacity.Provider provider = writeTokenProvider();
+        fs.setCapacity(provider);
+        FsInode dir = fs.mkdir("/dir");
+        setWriteToken(dir, "42");
+        FsInode file = fs.createFile(dir, "file");
+
+        fs.getFsStat(file);
+
+        verify(provider).getForWriteToken("42");
+    }
+
+    @Test
+    public void shouldReportCapacityWithoutWriteTokenForDirectoryWithoutTag() throws Exception {
+        Capacity.Provider provider = writeTokenProvider();
+        fs.setCapacity(provider);
+
+        fs.getFsStat(fs.mkdir("/dir"));
+
+        verify(provider).getForWriteToken(null);
+    }
+
+    @Test
+    public void shouldIgnoreInodeIfReservationIsNotTakenFromWriteToken() throws Exception {
+        Capacity.Provider provider = provider(Capacity.Source.POOLS);
+        when(provider.get()).thenReturn(Capacity.UNKNOWN);
+        fs.setCapacity(provider);
+        FsInode dir = fs.mkdir("/dir");
+        setWriteToken(dir, "42");
+
+        fs.getFsStat(dir);
+
+        verify(provider).get();
+        verify(provider, never()).getForWriteToken(any());
+    }
+
+    @Test
+    public void shouldFallBackToNamespaceStatisticsForInode() throws Exception {
+        Capacity.Provider provider = writeTokenProvider();
+        when(provider.getForWriteToken(any())).thenThrow(new CacheException("not found"));
+        fs.setCapacity(provider);
+
+        FsStat stat = fs.getFsStat(fs.mkdir("/dir"));
+
+        assertEquals(JdbcFs.AVAILABLE_SPACE, stat.getTotalSpace());
+    }
+
+    private void setWriteToken(FsInode dir, String token) throws Exception {
+        byte[] data = token.getBytes(StandardCharsets.UTF_8);
+        fs.createTag(dir, "WriteToken");
+        fs.setTag(dir, "WriteToken", data, 0, data.length);
+    }
+
+    private static Capacity.Provider writeTokenProvider() throws CacheException {
         Capacity.Provider provider = provider(Capacity.Source.RESERVATION);
         when(provider.usesWriteToken()).thenReturn(true);
-        fs.setCapacity(provider);
+        when(provider.getForWriteToken(any())).thenReturn(Capacity.UNKNOWN);
+        return provider;
     }
 
     private static Capacity.Provider provider(Capacity.Source source) {
