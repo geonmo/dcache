@@ -76,6 +76,7 @@ import java.io.File;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
 import java.security.AccessController;
 import java.sql.SQLException;
 import java.time.Instant;
@@ -181,6 +182,9 @@ public class DCacheAwareJdbcFs extends JdbcFs implements CellIdentityAware {
 
     private Capacity.Provider capacity;
 
+    private static final String WRITE_TOKEN_TAG = "WriteToken";
+    private static final int MAX_WRITE_TOKEN_LENGTH = 256;
+
     @Required
     public void setQueryPnfsManagerOnRename(boolean yes) {
         queryPnfsManagerOnRename = yes;
@@ -213,11 +217,6 @@ public class DCacheAwareJdbcFs extends JdbcFs implements CellIdentityAware {
     }
 
     public void setCapacity(Capacity.Provider capacity) {
-        if (capacity.usesWriteToken()) {
-            // NFS doesn't tell the door which export a statfs request is for.
-            throw new IllegalArgumentException(
-                  "nfs.capacity.source=reservation requires nfs.capacity.reservation");
-        }
         this.capacity = capacity;
     }
 
@@ -234,6 +233,49 @@ public class DCacheAwareJdbcFs extends JdbcFs implements CellIdentityAware {
         } catch (CacheException e) {
             return fsStat; // logged by Capacity.Provider
         }
+    }
+
+    /**
+     * Reports the capacity of the space reservation given by the WriteToken tag of the inode, if
+     * the reservation is not configured. Otherwise, the capacity does not depend on the inode.
+     */
+    @Override
+    public FsStat getFsStat(FsInode inode) throws ChimeraFsException {
+        if (capacity == null || !capacity.usesWriteToken()) {
+            return getFsStat();
+        }
+        FsStat fsStat = super.getFsStat();
+        try {
+            Capacity c = capacity.getForWriteToken(writeTokenOf(inode));
+            return new FsStat(c.getTotalSpace(), fsStat.getTotalFiles(), c.getUsedSpace(),
+                  fsStat.getUsedFiles());
+        } catch (CacheException e) {
+            return fsStat; // logged by Capacity.Provider
+        }
+    }
+
+    /**
+     * Returns the WriteToken tag of a directory, or of the directory of a file, or null.
+     */
+    private String writeTokenOf(FsInode inode) throws ChimeraFsException {
+        FsInode dir = new FsInode(this, inode.ino());
+        if (!dir.isDirectory()) {
+            dir = dir.getParent();
+            if (dir == null) {
+                return null;
+            }
+        }
+        byte[] data = new byte[MAX_WRITE_TOKEN_LENGTH];
+        int len;
+        try {
+            len = getTag(dir, WRITE_TOKEN_TAG, data, 0, data.length);
+        } catch (FileNotFoundChimeraFsException e) {
+            return null;
+        }
+        String value = new String(data, 0, len, StandardCharsets.UTF_8);
+        int eol = value.indexOf('\n');
+        String token = (eol < 0 ? value : value.substring(0, eol)).strip();
+        return token.isEmpty() ? null : token;
     }
 
     @Override

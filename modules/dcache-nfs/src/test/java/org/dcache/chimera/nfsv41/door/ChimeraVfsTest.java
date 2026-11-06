@@ -3,6 +3,9 @@ package org.dcache.chimera.nfsv41.door;
 
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
+import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.verify;
 
 import com.google.common.collect.Lists;
 import com.google.common.io.Resources;
@@ -183,5 +186,14 @@ public class ChimeraVfsTest {
 
     }
 
+    @Test
+    public void shouldPassQueriedInodeToFsStat() throws Exception {
+        FsInode dir = _fs.mkdir("/dir");
+        JdbcFs fs = spy(_fileFileSystemProvider);
+        ChimeraVfs vfs = new ChimeraVfs(fs, null);
 
+        vfs.getFsStat(vfs.lookup(vfs.getRootInode(), "dir"));
+
+        verify(fs).getFsStat(argThat((FsInode inode) -> inode.ino() == dir.ino()));
+    }
 }

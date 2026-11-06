@@ -385,7 +385,15 @@ public class ChimeraVfs implements VirtualFileSystem, AclCheckable, QuotaVfs {
 
     @Override
     public FsStat getFsStat() throws IOException {
-        org.dcache.chimera.FsStat fsStat = _fs.getFsStat();
+        return toFsStat(_fs.getFsStat());
+    }
+
+    @Override
+    public FsStat getFsStat(Inode inode) throws IOException {
+        return toFsStat(_fs.getFsStat(toFsInode(inode)));
+    }
+
+    private static FsStat toFsStat(org.dcache.chimera.FsStat fsStat) {
         return new FsStat(fsStat.getTotalSpace(),
               fsStat.getTotalFiles(),
               fsStat.getUsedSpace(),

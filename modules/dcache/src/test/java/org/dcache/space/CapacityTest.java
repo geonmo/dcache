@@ -144,6 +144,35 @@ public class CapacityTest {
     }
 
     @Test
+    public void shouldReportReservationOfGivenWriteToken() throws Exception {
+        Capacity capacity = provider("reservation", "").getForWriteToken("42");
+
+        assertThat(capacity.getTotalSpace(), is(1000L));
+        assertThat(capacity.getReservation(), is(Optional.of("42")));
+    }
+
+    @Test
+    public void shouldReportAllPoolsWithoutGivenWriteToken() throws Exception {
+        givenPools(pool("pool1", 1000, 100, 50), pool("pool2", 2000, 300, 0));
+
+        Capacity capacity = provider("reservation", "").getForWriteToken(null);
+
+        assertThat(capacity.getTotalSpace(), is(3000L));
+        assertThat(capacity.getReservation(), is(Optional.empty()));
+    }
+
+    @Test
+    public void shouldPreferConfiguredReservationOverGivenWriteToken() throws Exception {
+        assertThat(provider("reservation", "42").getForWriteToken("7").getReservation(),
+              is(Optional.of("42")));
+    }
+
+    @Test
+    public void shouldReportFixedSizeForNamespaceWithGivenWriteToken() throws Exception {
+        assertThat(provider("namespace", "").getForWriteToken("42"), is(Capacity.UNKNOWN));
+    }
+
+    @Test
     public void shouldRecoverWhenReservationReappears() throws Exception {
         Capacity.Provider provider = provider("reservation", "42");
         space = Optional.empty();

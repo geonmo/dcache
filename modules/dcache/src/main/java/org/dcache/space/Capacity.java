@@ -168,6 +168,25 @@ public final class Capacity {
             }
             String token = reservation != null || path == null ? reservation
                   : path.getStorageInfo().getMap().get("writeToken");
+            return get(token, path, host, protocol);
+        }
+
+        /**
+         * Returns the capacity to report for a path with the given WriteToken tag, for doors that
+         * know the queried path but not its storage info: with 'reservation', that space
+         * reservation, unless one is configured, and otherwise, or without a token, all pools.
+         *
+         * @param writeToken the WriteToken tag of the queried path, or null
+         */
+        public Capacity getForWriteToken(String writeToken) throws CacheException {
+            if (source == Source.NAMESPACE) {
+                return UNKNOWN;
+            }
+            return get(reservation != null ? reservation : writeToken, null, null, null);
+        }
+
+        private Capacity get(String token, FileAttributes path, String host, String protocol)
+              throws CacheException {
             boolean pools = source == Source.POOLS || token == null;
             String what = pools ? "pools" : "space reservation " + token;
             try {
